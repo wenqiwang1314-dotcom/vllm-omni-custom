@@ -13,12 +13,13 @@ stage_args:
       model_arch: Qwen2_5OmniForConditionalGeneration
       worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
-      gpu_memory_utilization: 0.8
+      gpu_memory_utilization: 0.63
       enforce_eager: true  # Now we only support eager mode
       trust_remote_code: true
       engine_output_type: latent
       enable_prefix_caching: false
-      max_num_batched_tokens: 32768
+      max_model_len: 512
+      max_num_batched_tokens: 512
     is_comprehension: true
     final_output: true
     final_output_type: text
@@ -26,7 +27,7 @@ stage_args:
       temperature: 0.0
       top_p: 1.0
       top_k: -1
-      max_tokens: 2048
+      max_tokens: 1024
       seed: 42
       detokenize: True
       repetition_penalty: 1.1
@@ -35,18 +36,19 @@ stage_args:
     stage_type: llm  # Use llm stage type to launch OmniLLM
     runtime:
       process: true
-      devices: "1"
+      devices: "0"
       max_batch_size: 1
     engine_args:
       model_stage: talker
       model_arch: Qwen2_5OmniForConditionalGeneration
       worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
-      gpu_memory_utilization: 0.8
+      gpu_memory_utilization: 0.28
       enforce_eager: true
       trust_remote_code: true
       enable_prefix_caching: false
-      max_num_batched_tokens: 32768
+      max_model_len: 512
+      max_num_batched_tokens: 512
       engine_output_type: latent
     engine_input_source: [0]
     custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen2_5_omni.thinker2talker
@@ -54,7 +56,7 @@ stage_args:
       temperature: 0.9
       top_p: 0.8
       top_k: 40
-      max_tokens: 2048
+      max_tokens: 1024
       seed: 42
       detokenize: True
       repetition_penalty: 1.05
@@ -71,11 +73,12 @@ stage_args:
       model_arch: Qwen2_5OmniForConditionalGeneration
       worker_cls: vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
-      gpu_memory_utilization: 0.15
+      gpu_memory_utilization: 0.06
       enforce_eager: true
       trust_remote_code: true
       enable_prefix_caching: false
-      max_num_batched_tokens: 32768
+      max_model_len: 512
+      max_num_batched_tokens: 512
       engine_output_type: audio
     engine_input_source: [1]
     final_output: true
@@ -84,7 +87,7 @@ stage_args:
       temperature: 0.0
       top_p: 1.0
       top_k: -1
-      max_tokens: 2048
+      max_tokens: 1024
       seed: 42
       detokenize: True
       repetition_penalty: 1.1

@@ -165,7 +165,7 @@ output=$(curl -sS -X POST http://localhost:8091/v1/chat/completions \
     -H "Content-Type: application/json" \
     -d @- <<EOF
 {
-  "model": "Qwen/Qwen2.5-Omni-7B",
+  "model": "Qwen-Omni",
   "sampling_params_list": $sampling_params_list,
   "mm_processor_kwargs": $mm_processor_kwargs,
   "modalities": $MODALITIES,
