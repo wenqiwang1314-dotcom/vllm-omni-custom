@@ -233,3 +233,4 @@ configs/development.yaml
 Dockerfile.dev
 discussion
 tmp_test
+evalset/v1/video_text/video/sources/cvb/58916v001.txt
