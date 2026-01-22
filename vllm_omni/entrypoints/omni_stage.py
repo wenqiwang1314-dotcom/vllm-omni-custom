@@ -16,6 +16,8 @@ import sys
 import traceback
 from typing import Any
 
+import copy
+
 from vllm.inputs import TextPrompt
 from vllm.inputs.preprocess import InputPreprocessor
 from vllm.logger import init_logger
@@ -44,6 +46,16 @@ from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.utils import detect_device_type
 
 logger = init_logger(__name__)
+
+
+def _stage_process_entry(target, stage_env: dict, *args, **kwargs):
+    # 在 CUDA 初始化前设置环境变量（关键）
+    print("[Stage env] CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=",
+      os.environ.get("CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"))
+    if stage_env:
+        os.environ.update({k: str(v) for k, v in stage_env.items()})
+    return target(*args, **kwargs)
+
 
 
 def prepare_sampling_params(sampling_params: Any, stage_type: str) -> Any:
@@ -271,10 +283,16 @@ class OmniStage:
                         batch_timeout=batch_timeout,
                     )
             else:
+                # 从 stage_payload["runtime"]["env"] 读取（推荐做 deep copy，避免引用问题）
+                runtime_cfg = stage_payload.get("runtime", {}) if isinstance(stage_payload, dict) else {}
+                stage_env = copy.deepcopy(runtime_cfg.get("env", {})) if isinstance(runtime_cfg, dict) else {}
+
                 if is_async:
                     self._proc = ctx.Process(
-                        target=_stage_worker_async_entry,
+                        target=_stage_process_entry,
                         args=(
+                            _stage_worker_async_entry,
+                            stage_env,
                             self,
                             model,
                             stage_payload,
@@ -283,8 +301,10 @@ class OmniStage:
                     )
                 else:
                     self._proc = ctx.Process(
-                        target=_stage_worker,
+                        target=_stage_process_entry,
                         args=(
+                            _stage_worker,
+                            stage_env,
                             model,
                             stage_payload,
                             self._in_q,
@@ -292,6 +312,7 @@ class OmniStage:
                             batch_timeout,
                         ),
                     )
+
                 self._proc.start()
         finally:
             if old_env is None:

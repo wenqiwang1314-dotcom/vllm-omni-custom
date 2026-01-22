@@ -1,0 +1,35 @@
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    runtime:
+      process: true
+      devices: "0"
+      max_batch_size: 1
+    engine_args:
+      model_stage: code2wav
+      model_arch: Qwen2_5OmniForConditionalGeneration
+      worker_cls: vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      gpu_memory_utilization: 0.06
+      enforce_eager: true
+      trust_remote_code: true
+      enable_prefix_caching: false
+      max_model_len: 1024
+      max_num_batched_tokens: 1024
+      engine_output_type: audio
+    final_output: true
+    final_output_type: audio
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 256
+      seed: 42
+      detokenize: true
+      repetition_penalty: 1.1
+
+runtime:
+  enabled: true
+  defaults:
+    window_size: -1
+    max_inflight: 1
