@@ -18,6 +18,13 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner, IntermediateTensors,
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
+
+from vllm_omni.utils.green_context import GreenContext
+from vllm_omni.utils.green_context import VLLM_REQ_ID  # 你上面文件里暴露出来的变量
+import uuid
+
+
+
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 else:
@@ -37,6 +44,15 @@ class OmniGPUModelRunner(GPUModelRunner):
         self._omni_per_req_additional_information: dict[str, dict] | None = None
         self._omni_num_scheduled_tokens_np: np.ndarray | None = None
         self._omni_last_model_output: object | None = None
+
+        # add
+        self._green_ctx = GreenContext()
+        if self._green_ctx.enabled:
+            logger.warning(
+                f"[GreenContext] enabled percent={self._green_ctx.percent} "
+                f"actual_sm={self._green_ctx.actual_sm} total_sm={self._green_ctx.total_sm} "
+                f"align={self._green_ctx.align} max_valid={self._green_ctx.max_valid}"
+            )
 
     def _init_mrope_positions(self, req_state: CachedRequestState):
         """Initialize M-RoPE positions for multimodal inputs.
@@ -888,6 +904,12 @@ class OmniGPUModelRunner(GPUModelRunner):
         **model_kwargs: dict[str, Any],
     ):
         """Inject omni-specific kwargs into forward and cache model output"""
+        import os
+        import uuid
+
+        # 这个 VLLM_REQ_ID 是你 green_context.py 里定义的 contextvar
+        from vllm_omni.utils.green_context import VLLM_REQ_ID
+
         model_kwargs_extra = self._build_model_kwargs_extra()
 
         runtime_info = model_kwargs_extra.get("runtime_additional_information", [])
@@ -896,17 +918,69 @@ class OmniGPUModelRunner(GPUModelRunner):
                 if info:
                     logger.debug(f"[OMNI] req[{i}] runtime_additional_information keys: {list(info.keys())}")
 
-        model_output = super()._model_forward(
-            input_ids=input_ids,
-            positions=positions,
-            intermediate_tensors=intermediate_tensors,
-            inputs_embeds=inputs_embeds,
-            **model_kwargs,
-            **model_kwargs_extra,
-        )
+        # -----------------------------
+        # 1) 尝试提取“真实 request id”
+        # 优先从 runtime_additional_information 找（通常每个 micro-batch 对应一个 info dict）
+        # 找不到就从 kwargs 找，再找不到生成一个短uuid
+        # -----------------------------
+        rid = None
+
+        # runtime_info 可能是 list[dict]，你日志里也在按 req[i] 打
+        if isinstance(runtime_info, list) and runtime_info:
+            # 取第一个非空 dict
+            for info in runtime_info:
+                if isinstance(info, dict) and info:
+                    # 常见候选字段名（你后面如果发现真实字段名，把它放最前面）
+                    for k in ("request_id", "req_id", "requestId", "id"):
+                        if k in info:
+                            rid = str(info[k])
+                            break
+                    if rid:
+                        break
+
+        if rid is None:
+            # 有些路径会把它直接塞进 kwargs
+            rid = model_kwargs_extra.get("request_id") or model_kwargs.get("request_id")
+
+        if rid is None:
+            # 兜底：生成一个 sweep 可关联的短 id
+            rid = f"gen-{uuid.uuid4().hex[:8]}"
+
+        # 可选：给 rid 加一点 stage 信息，方便 grep（不强制）
+        stage_id = os.getenv("VLLM_OMNI_STAGE_ID") or os.getenv("OMNI_STAGE_ID") or os.getenv("VLLM_STAGE_ID")
+        if stage_id is not None and not str(rid).startswith(f"s{stage_id}-"):
+            rid = f"s{stage_id}-{rid}"
+
+        token = VLLM_REQ_ID.set(str(rid))
+
+        try:
+            # Run the actual forward inside Green Context stream (if enabled).
+            if hasattr(self, "_green_ctx") and self._green_ctx.enabled:
+                with self._green_ctx:
+                    model_output = super()._model_forward(
+                        input_ids=input_ids,
+                        positions=positions,
+                        intermediate_tensors=intermediate_tensors,
+                        inputs_embeds=inputs_embeds,
+                        **model_kwargs,
+                        **model_kwargs_extra,
+                    )
+            else:
+                model_output = super()._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                    **model_kwargs_extra,
+                )
+        finally:
+            VLLM_REQ_ID.reset(token)
+
         # Cache model output so later sample_tokens can consume multimodal results.
         self._omni_last_model_output = model_output
         return model_output
+
 
     def _merge_additional_information_update(self, req_id: str, upd: dict) -> None:
         req_state = self.requests.get(req_id)

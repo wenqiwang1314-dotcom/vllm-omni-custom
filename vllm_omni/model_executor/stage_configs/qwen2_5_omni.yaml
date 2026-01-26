@@ -8,8 +8,6 @@ stage_args:
       process: true            # Run this stage in a separate process
       devices: "0"            # Visible devices for this stage (CUDA_VISIBLE_DEVICES/torch.cuda.set_device)
       max_batch_size: 1
-      env:
-        CUDA_MPS_ACTIVE_THREAD_PERCENTAGE: "100"
     engine_args:
       model_stage: thinker
       model_arch: Qwen2_5OmniForConditionalGeneration
@@ -40,8 +38,6 @@ stage_args:
       process: true
       devices: "0"
       max_batch_size: 1
-      env:
-        CUDA_MPS_ACTIVE_THREAD_PERCENTAGE: "100"
     engine_args:
       model_stage: talker
       model_arch: Qwen2_5OmniForConditionalGeneration
@@ -72,8 +68,6 @@ stage_args:
       process: true
       devices: "0"            # Example: use a different GPU than the previous stage; use "0" if single GPU
       max_batch_size: 1
-      env:
-        CUDA_MPS_ACTIVE_THREAD_PERCENTAGE: "100"
     engine_args:
       model_stage: code2wav
       model_arch: Qwen2_5OmniForConditionalGeneration
