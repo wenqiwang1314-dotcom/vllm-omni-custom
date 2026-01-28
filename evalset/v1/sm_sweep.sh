@@ -49,7 +49,7 @@ VLLM_CMD_BASE=(
   --host 0.0.0.0 --port "$PORT"
   --served-model-name "$MODEL"
   --trust-remote-code
-  --enforce-eager
+  #--enforce-eager
   --max-model-len 1024
   --max-num-seqs 1
 )

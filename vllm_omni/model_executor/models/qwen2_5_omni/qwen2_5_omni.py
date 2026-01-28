@@ -299,18 +299,39 @@ class Qwen2_5OmniForConditionalGeneration(
             )
 
         if self.model_stage == "code2wav":
-            code = (
-                input_ids
-                if input_ids is not None
-                else torch.zeros(
-                    inputs_embeds.shape[0],
-                    dtype=torch.long,
-                    device=inputs_embeds.device,
-                )
-            )
+            # 1) 取 code；确保是 tensor 且在正确 device 上
+            if input_ids is None:
+                # 注意：inputs_embeds 可能是 [B, T, D]；这里用 device 即可
+                code = torch.empty((0,), dtype=torch.long, device=inputs_embeds.device)
+            else:
+                code = input_ids
 
-            code = code[:-1] if code[-1] == TALKER_CODEC_EOS_TOKEN_ID else code
-            code = code[1:] if code[0] == TALKER_CODEC_BOS_TOKEN_ID else code
+            # 2) 统一成 1D：常见情况 input_ids 是 [T] 或 [B, T]
+            if code.dim() == 2:
+                # B=1 时取第0条；如果未来 B>1，你需要循环/批处理
+                code = code[0]
+            elif code.dim() > 2:
+                # 极端情况，直接 flatten（或 raise 更严格）
+                code = code.view(-1)
+
+            code = code.to(dtype=torch.long)
+
+            # 3) 空保护：避免 code[-1]/code[0] 越界
+            if code.numel() == 0:
+                # 返回一个“空音频”占位，保证不会把 EngineCore 干死
+                audio_tensor = torch.empty((0,), device=code.device)
+                return OmniOutput(text_hidden_states=None, multimodal_outputs={"model_outputs": audio_tensor})
+
+            # 4) 去掉 EOS / BOS（先判长度）
+            if code.numel() > 0 and code[-1].item() == TALKER_CODEC_EOS_TOKEN_ID:
+                code = code[:-1]
+            if code.numel() > 0 and code[0].item() == TALKER_CODEC_BOS_TOKEN_ID:
+                code = code[1:]
+
+            # 5) strip 之后可能又空，再保护一次（可选但建议）
+            if code.numel() == 0:
+                audio_tensor = torch.empty((0,), device=code.device)
+                return OmniOutput(text_hidden_states=None, multimodal_outputs={"model_outputs": audio_tensor})
 
             audio_tensor = self.generate_audio(code, voice_type)
             return OmniOutput(text_hidden_states=None, multimodal_outputs={"model_outputs": audio_tensor})
