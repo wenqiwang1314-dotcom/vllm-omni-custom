@@ -21,12 +21,18 @@ LOG_DIR="/home/konnext/Lucas/vllm-omni/evalset/v1/logs"
 OUT_DIR="/home/konnext/Lucas/vllm-omni/evalset/v1/logs"
 RUN_TAG="sm_sweep_$(date +%F_%H%M%S)"
 
+IMAGE_PATH="/home/konnext/Lucas/vllm-omni/evalset/v1/image_text/images/coco_494579_coco494579.jpg"
+
+
 # Trials
 N_WARMUP=5
 N_TRIAL=20
-MAX_TOKENS=256
+#MAX_TOKENS=256
 
-PROMPT='Write a detailed explanation (at least 400 words) of how transformers decode tokens step by step. Mention KV cache.'
+#PROMPT='Write a detailed explanation (at least 400 words) of how transformers decode tokens step by step. Mention KV cache.'
+
+MAX_TOKENS=64
+PROMPT='Describe the image in one concise sentence.'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -50,7 +56,7 @@ VLLM_CMD_BASE=(
   --served-model-name "$MODEL"
   --trust-remote-code
   #--enforce-eager
-  --max-model-len 1024
+  --max-model-len 512
   --max-num-seqs 1
 )
 
@@ -76,6 +82,46 @@ need_cmd ts || { echo "[ERROR] missing 'ts' (moreutils). Install: sudo apt-get i
 need_cmd fuser || { echo "[ERROR] missing 'fuser'. Install: sudo apt-get install psmisc" >&2; exit 1; }
 
 # ====== Helpers ======
+
+img_server_pid=""
+
+start_img_server() {
+  if ss -ltnp | grep -q ":${IMG_PORT}\b"; then
+    echo "[INFO] Image server already listening on :$IMG_PORT"
+    return 0
+  fi
+
+  echo "[INFO] Starting image static server at http://${IMG_HOST}:${IMG_PORT}/ (root=${IMG_ROOT})"
+  (
+    cd "$IMG_ROOT"
+    setsid stdbuf -oL -eL python3 -m http.server "$IMG_PORT" --bind "$IMG_HOST" \
+      2>&1 | stdbuf -oL -eL ts '[%Y-%m-%d %H:%M:%S]' \
+      | tee -a "$LOG_DIR/${RUN_TAG}_imgserver.log"
+  ) &
+  img_server_pid=$!
+
+  # wait ready
+  for _ in $(seq 1 50); do
+    if curl -fsS "http://${IMG_HOST}:${IMG_PORT}/${IMAGE_FILE}" >/dev/null 2>&1; then
+      echo "[INFO] Image server OK, sample accessible: ${IMAGE_URL}"
+      return 0
+    fi
+    sleep 0.1
+  done
+
+  echo "[ERROR] Image server failed to serve sample: ${IMAGE_URL}" >&2
+  return 1
+}
+
+stop_img_server() {
+  if [[ -n "${img_server_pid:-}" ]]; then
+    echo "[INFO] Stopping image server pid=$img_server_pid"
+    kill -TERM "-$img_server_pid" >/dev/null 2>&1 || true
+    img_server_pid=""
+  fi
+}
+
+
 now_iso() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 
 port_listening() {
@@ -303,11 +349,14 @@ EOF
 }
 
 # ====== Cleanup trap ======
+
+
 cleanup() {
   if [[ "${SERVER_PID:-}" != "" ]]; then
     stop_server "$SERVER_PID" || true
   fi
 }
+
 trap cleanup EXIT
 
 # ====== Sweep ======
@@ -338,14 +387,18 @@ for P in "${P_LIST[@]}"; do
   ready_check
 
   echo "[INFO] About to run request_sweep, writing to $REQ_FILE"
-  python3 "$SCRIPT_DIR/request_sweep.py" \
+
+  python3 "$SCRIPT_DIR/request_sweep_image.py" \
     --host "$HOST" --port "$PORT" \
     --model "$MODEL" \
     --percent "$P" \
     --warmup "$N_WARMUP" --trials "$N_TRIAL" \
     --max-tokens "$MAX_TOKENS" \
+    --temperature 0.0 \
     --prompt "$PROMPT" \
+    --image-path "$IMAGE_PATH" \
     --out-jsonl "$REQ_FILE"
+
 
   # Assert: request file must have content
   if [[ ! -s "$REQ_FILE" ]]; then
