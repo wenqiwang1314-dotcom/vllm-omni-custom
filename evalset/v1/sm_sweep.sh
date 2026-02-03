@@ -1,165 +1,98 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ============================================================
-# Enhanced SM Sweep Script (paste-and-run)
-# Key upgrades:
-# - Strict pre-clean + post-stop assertions (port + GPU processes)
-# - Two-stage readiness: /health + 1-token "ready" request
-# - Optional CPU pinning + thread controls for stability
-# - Per-run meta.json capturing environment + versions
-# - Hardened timeouts, better debug dumps on failures
-# ============================================================
+# ==========================================
+# SM sweep (10..100 step 10) for BOTH image+audio
+# - starts vLLM server per percent (clean lifecycle)
+# - runs request_sweep_mm.py twice (image + audio)
+# - outputs per-percent logs + jsonl
+# - merges all jsonl at the end
+# ==========================================
 
-# ====== Config ======
-HOST="127.0.0.1"
-PORT="8091"
-MODEL="Qwen-Omni"          # served model name
-MODEL_TAG="Qwen/Qwen2.5-Omni-7B"
+# -------- Config --------
+HOST="${HOST:-127.0.0.1}"
+PORT="${PORT:-8091}"
+MODEL="${MODEL:-Qwen-Omni}"                # served model name
+MODEL_TAG="${MODEL_TAG:-Qwen/Qwen2.5-Omni-7B}"
 
-LOG_DIR="/home/konnext/Lucas/vllm-omni/evalset/v1/logs"
-OUT_DIR="/home/konnext/Lucas/vllm-omni/evalset/v1/logs"
-RUN_TAG="sm_sweep_$(date +%F_%H%M%S)"
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+VLLM_GREEN_DEVICE="${VLLM_GREEN_DEVICE:-0}"
 
-IMAGE_PATH="/home/konnext/Lucas/vllm-omni/evalset/v1/image_text/images/coco_494579_coco494579.jpg"
+# Paths
+BASE_DIR="${BASE_DIR:-/home/konnext/Lucas/vllm-omni/evalset/v1}"
+SCRIPT_DIR="${SCRIPT_DIR:-$BASE_DIR}"     # request_sweep_mm.py lives here
 
+
+
+LOG_DIR="${LOG_DIR:-$BASE_DIR/logs}"
+OUT_DIR="${OUT_DIR:-$BASE_DIR/logs}"
+
+IMAGE_PATH="${IMAGE_PATH:-$BASE_DIR/image_text/images/coco_342952_coco342952.jpg}"
+AUDIO_PATH="${AUDIO_PATH:-$BASE_DIR/audio_text/agri_samples_esc50/wav/cow__1-81269-A-3.wav}"
 
 # Trials
-N_WARMUP=5
-N_TRIAL=20
-#MAX_TOKENS=256
+N_WARMUP="${N_WARMUP:-5}"
+N_TRIAL="${N_TRIAL:-20}"
+MAX_TOKENS="${MAX_TOKENS:-256}"
+TEMP="${TEMP:-0.0}"
 
-#PROMPT='Write a detailed explanation (at least 400 words) of how transformers decode tokens step by step. Mention KV cache.'
 
-MAX_TOKENS=64
-PROMPT='Describe the image in one concise sentence.'
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROMPT_IMAGE="${PROMPT_IMAGE:-Describe the image in one concise sentence.}"
+PROMPT_AUDIO="${PROMPT_AUDIO:-Listen to the audio and describe what is happening in one concise sentence.}"
 
-# ---- Stability knobs (safe defaults) ----
-# CPU pinning: set to a CPU list like "0-15" or "0,2,4,6" if you want determinism
-CPU_LIST="${CPU_LIST:-}"          # e.g. export CPU_LIST="0-15"
-MEM_BIND="${MEM_BIND:-}"          # e.g. export MEM_BIND="0"  (numactl mem node)
-OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
-TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
+# text-only prompt（实用但不太长）
+PROMPT_TEXT="${PROMPT_TEXT:-In one or two sentences, explain what a GPU does.}"
+
+
+
+
+# Modalities (force text only output)
+MODALITIES="${MODALITIES:-text,audio}"
+
+
+# Optional: audio send mode
+AUDIO_SEND_MODE="${AUDIO_SEND_MODE:-audio_url}"
+
+# vLLM serve args
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-512}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"
 
 # Timeouts
-HEALTH_TIMEOUT_SEC="${HEALTH_TIMEOUT_SEC:-240}"   # health polling max seconds
-READY_TIMEOUT_SEC="${READY_TIMEOUT_SEC:-240}"     # readiness polling max seconds
-STOP_TIMEOUT_SEC="${STOP_TIMEOUT_SEC:-6}"         # seconds to wait after TERM before KILL
-PORT_RELEASE_TIMEOUT_SEC="${PORT_RELEASE_TIMEOUT_SEC:-10}"
+HEALTH_TIMEOUT_SEC="${HEALTH_TIMEOUT_SEC:-240}"
+READY_TIMEOUT_SEC="${READY_TIMEOUT_SEC:-240}"
+STOP_TIMEOUT_SEC="${STOP_TIMEOUT_SEC:-8}"
+PORT_RELEASE_TIMEOUT_SEC="${PORT_RELEASE_TIMEOUT_SEC:-12}"
 
-# ====== vLLM command ======
-VLLM_CMD_BASE=(
-  vllm serve "$MODEL_TAG" --omni
-  --host 0.0.0.0 --port "$PORT"
-  --served-model-name "$MODEL"
-  --trust-remote-code
-  #--enforce-eager
-  --max-model-len 512
-  --max-num-seqs 1
-)
+RUN_TAG="${RUN_TAG:-sm_sweep_$(date +%F_%H%M%S)}"
 
-# ====== Paths ======
 mkdir -p "$LOG_DIR" "$OUT_DIR"
 
-REQ_JSONL="$OUT_DIR/${RUN_TAG}_requests.jsonl"
-CSV_OUT="$OUT_DIR/${RUN_TAG}_merged.csv"
-META_JSON="$OUT_DIR/${RUN_TAG}_meta.json"
+echo "[INFO] RUN_TAG=$RUN_TAG"
+echo "[INFO] LOG_DIR=$LOG_DIR"
+echo "[INFO] OUT_DIR=$OUT_DIR"
+echo "[INFO] IMAGE_PATH=$IMAGE_PATH"
+echo "[INFO] AUDIO_PATH=$AUDIO_PATH"
 
-echo "RUN_TAG=$RUN_TAG"
-echo "REQ_JSONL=$REQ_JSONL"
-echo "CSV_OUT=$CSV_OUT"
-echo "META_JSON=$META_JSON"
-
-# ====== Minimal deps check ======
-need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "[ERROR] missing command: $1" >&2; exit 1; }; }
+# -------- deps --------
+need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "[ERROR] missing: $1" >&2; exit 1; }; }
 need_cmd curl
 need_cmd ss
-need_cmd ps
 need_cmd tee
+need_cmd fuser
+need_cmd python3
 need_cmd ts || { echo "[ERROR] missing 'ts' (moreutils). Install: sudo apt-get install moreutils" >&2; exit 1; }
-need_cmd fuser || { echo "[ERROR] missing 'fuser'. Install: sudo apt-get install psmisc" >&2; exit 1; }
 
-# ====== Helpers ======
+# -------- helpers --------
+port_listening() { ss -ltnp | grep -q ":${PORT}\b"; }
 
-img_server_pid=""
-
-start_img_server() {
-  if ss -ltnp | grep -q ":${IMG_PORT}\b"; then
-    echo "[INFO] Image server already listening on :$IMG_PORT"
-    return 0
-  fi
-
-  echo "[INFO] Starting image static server at http://${IMG_HOST}:${IMG_PORT}/ (root=${IMG_ROOT})"
-  (
-    cd "$IMG_ROOT"
-    setsid stdbuf -oL -eL python3 -m http.server "$IMG_PORT" --bind "$IMG_HOST" \
-      2>&1 | stdbuf -oL -eL ts '[%Y-%m-%d %H:%M:%S]' \
-      | tee -a "$LOG_DIR/${RUN_TAG}_imgserver.log"
-  ) &
-  img_server_pid=$!
-
-  # wait ready
-  for _ in $(seq 1 50); do
-    if curl -fsS "http://${IMG_HOST}:${IMG_PORT}/${IMAGE_FILE}" >/dev/null 2>&1; then
-      echo "[INFO] Image server OK, sample accessible: ${IMAGE_URL}"
-      return 0
-    fi
-    sleep 0.1
-  done
-
-  echo "[ERROR] Image server failed to serve sample: ${IMAGE_URL}" >&2
-  return 1
-}
-
-stop_img_server() {
-  if [[ -n "${img_server_pid:-}" ]]; then
-    echo "[INFO] Stopping image server pid=$img_server_pid"
-    kill -TERM "-$img_server_pid" >/dev/null 2>&1 || true
-    img_server_pid=""
-  fi
-}
-
-
-now_iso() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
-
-port_listening() {
-  ss -ltnp | grep -q ":${PORT}\b"
-}
-
-dump_debug() {
-  echo "[DEBUG] Listening sockets on :$PORT"
-  ss -ltnp | grep ":${PORT}\b" || true
-
-  echo "[DEBUG] Top vLLM-related processes"
-  ps aux | egrep "vllm|api_server|omni_stage|EngineCore" | grep -v grep || true
-
-  echo "[DEBUG] GPU compute apps (if available)"
-  if command -v nvidia-smi >/dev/null 2>&1; then
-    nvidia-smi --query-compute-apps=pid,process_name,used_gpu_memory --format=csv,noheader 2>/dev/null || true
-  fi
-}
-
-# Best-effort: list compute app PIDs on this GPU (may return empty on some drivers)
-gpu_app_pids() {
-  if ! command -v nvidia-smi >/dev/null 2>&1; then
-    return 0
-  fi
-  nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null \
-    | awk 'NF{print $1}' \
-    | sed 's/,//g' || true
-}
-
-# Wait for port to be released
 wait_port_released() {
-  local t0
-  t0="$(date +%s)"
+  local t0; t0="$(date +%s)"
   while port_listening; do
-    local t
-    t="$(date +%s)"
+    local t; t="$(date +%s)"
     if (( t - t0 >= PORT_RELEASE_TIMEOUT_SEC )); then
       echo "[WARN] Port :$PORT still listening after ${PORT_RELEASE_TIMEOUT_SEC}s" >&2
+      ss -ltnp | grep ":${PORT}\b" || true
       return 1
     fi
     sleep 0.1
@@ -167,61 +100,70 @@ wait_port_released() {
   return 0
 }
 
+assert_gpu_free() {
+  if ! command -v nvidia-smi >/dev/null 2>&1; then return 0; fi
+  local used
+  used="$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | head -n1 | tr -d ' ')"
+  echo "[INFO] GPU memory.used=${used} MiB"
+  # 你按经验设阈值：比如>2000MiB就认为没清干净
+  if [[ -n "$used" && "$used" -gt 2000 ]]; then
+    echo "[WARN] GPU memory still high after preclean; running port kill + gpu kill again"
+    fuser -k "${PORT}/tcp" >/dev/null 2>&1 || true
+    sleep 0.2
+  fi
+}
+
+cleanup_vllm() {
+  pkill -TERM -f "vllm serve" || true
+  pkill -TERM -f "VLLM::EngineCore" || true
+  pkill -TERM -f "$(which python) -c" || true
+
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    nvidia-smi --query-compute-apps=pid --format=csv,noheader \
+    | awk 'NF{print $1}' | xargs -r kill -KILL || true
+  fi
+
+  fuser -k 8091/tcp >/dev/null 2>&1 || true
+}
+
+
+
+
 wait_health() {
   local url="http://${HOST}:${PORT}/health"
-  local t0
-  t0="$(date +%s)"
-
+  local t0; t0="$(date +%s)"
   while true; do
     if curl -fsS "$url" >/dev/null 2>&1; then
       echo "[INFO] /health OK"
       return 0
     fi
-    local t
-    t="$(date +%s)"
+    local t; t="$(date +%s)"
     if (( t - t0 >= HEALTH_TIMEOUT_SEC )); then
-      echo "[ERROR] Health check timeout (${HEALTH_TIMEOUT_SEC}s): $url" >&2
-      dump_debug >&2
-      echo "[DEBUG] Last 200 lines of current log: ${LOG_FILE:-<unknown>}" >&2
-      if [[ -n "${LOG_FILE:-}" && -f "${LOG_FILE:-}" ]]; then
-        tail -n 200 "$LOG_FILE" >&2 || true
-      fi
+      echo "[ERROR] Health timeout ${HEALTH_TIMEOUT_SEC}s: $url" >&2
+      ss -ltnp | grep ":${PORT}\b" || true
       return 1
     fi
     sleep 0.5
   done
 }
 
-# A stricter readiness probe than /health:
-# send a minimal 1-token request so we know the model path is actually serving.
 ready_check() {
   local url="http://${HOST}:${PORT}/v1/chat/completions"
-  local t0
-  t0="$(date +%s)"
-
+  local t0; t0="$(date +%s)"
   local payload
   payload="$(cat <<EOF
-{"model":"$MODEL","messages":[{"role":"user","content":"ping"}],"max_tokens":1,"temperature":0}
+{"model":"$MODEL","messages":[{"role":"user","content":"ping"}],"max_tokens":1,"temperature":0,"modalities":["text"]}
 EOF
 )"
-
   while true; do
-    if curl -fsS -m 30 "$url" \
-      -H "Content-Type: application/json" \
-      -d "$payload" >/dev/null 2>&1; then
-      echo "[INFO] Ready request OK (/v1/chat/completions)"
+    if curl -fsS -m 30 "$url" -H "Content-Type: application/json" -d "$payload" >/dev/null 2>&1; then
+      echo "[INFO] Ready check OK"
       return 0
     fi
-
-    local t
-    t="$(date +%s)"
+    local t; t="$(date +%s)"
     if (( t - t0 >= READY_TIMEOUT_SEC )); then
-      echo "[ERROR] Ready check timeout (${READY_TIMEOUT_SEC}s): $url" >&2
-      dump_debug >&2
-      echo "[DEBUG] Last 200 lines of current log: ${LOG_FILE:-<unknown>}" >&2
-      if [[ -n "${LOG_FILE:-}" && -f "${LOG_FILE:-}" ]]; then
-        tail -n 200 "$LOG_FILE" >&2 || true
-      fi
+      echo "[ERROR] Ready timeout ${READY_TIMEOUT_SEC}s: $url" >&2
+      ss -ltnp | grep ":${PORT}\b" || true
       return 1
     fi
     sleep 0.5
@@ -229,217 +171,212 @@ EOF
 }
 
 preclean() {
-  echo "[INFO] Pre-clean port :$PORT and old vLLM processes"
-
-  # 1) kill anything listening on port (most reliable)
+  echo "[INFO] Pre-clean port :$PORT"
   fuser -k "${PORT}/tcp" >/dev/null 2>&1 || true
   sleep 0.2
-
-  # 2) cleanup possible remnants
-  pkill -f "vllm serve .*--port ${PORT}" >/dev/null 2>&1 || true
-  pkill -f "VLLM::EngineCore" >/dev/null 2>&1 || true
-  pkill -f "/home/konnext/Lucas/.venv/bin/python -c" >/dev/null 2>&1 || true
-  sleep 0.2
-
-  # 3) assert port released (best-effort)
   wait_port_released || true
+  assert_gpu_free || true
 }
+
+# -------- server lifecycle --------
+SERVER_PID=""
 
 start_server() {
   local percent="$1"
   local log_file="$2"
-  local pid_file="$3"
 
-  export CUDA_VISIBLE_DEVICES=0
-  export VLLM_GREEN_DEVICE=0
+  export CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES"
+  export VLLM_GREEN_DEVICE="$VLLM_GREEN_DEVICE"
   export VLLM_GREEN_SM_PERCENT="$percent"
 
-  export OMP_NUM_THREADS="$OMP_NUM_THREADS"
-  export TOKENIZERS_PARALLELISM="$TOKENIZERS_PARALLELISM"
-
-  echo "[INFO] Starting server percent=$percent log=$log_file pid_file=$pid_file"
-  echo "[INFO] Env: CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES VLLM_GREEN_DEVICE=$VLLM_GREEN_DEVICE VLLM_GREEN_SM_PERCENT=$VLLM_GREEN_SM_PERCENT OMP_NUM_THREADS=$OMP_NUM_THREADS TOKENIZERS_PARALLELISM=$TOKENIZERS_PARALLELISM CPU_LIST=${CPU_LIST:-<unset>} MEM_BIND=${MEM_BIND:-<unset>}"
-
-  # ---------- 构造 command 前缀 ----------
-  CMD_PREFIX=()
-  if [[ -n "${CPU_LIST:-}" && -n "${MEM_BIND:-}" && -x "$(command -v numactl)" ]]; then
-    CMD_PREFIX=(numactl --physcpubind="$CPU_LIST" --membind="$MEM_BIND")
-  elif [[ -n "${CPU_LIST:-}" ]]; then
-    CMD_PREFIX=(taskset -c "$CPU_LIST")
-  fi
-  # -------------------------------------
+  echo "[INFO] Starting vLLM percent=$percent"
+  echo "[INFO] Env: CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES VLLM_GREEN_DEVICE=$VLLM_GREEN_DEVICE VLLM_GREEN_SM_PERCENT=$VLLM_GREEN_SM_PERCENT"
 
   (
     setsid stdbuf -oL -eL \
-      "${CMD_PREFIX[@]}" "${VLLM_CMD_BASE[@]}" 2>&1 \
-      | stdbuf -oL -eL ts '[%Y-%m-%d %H:%M:%S]' \
-      | tee -a "$log_file"
+      vllm serve "$MODEL_TAG" --omni \
+        --host 0.0.0.0 --port "$PORT" \
+        --served-model-name "$MODEL" \
+        --trust-remote-code \
+        --max-model-len "$MAX_MODEL_LEN" \
+        --max-num-seqs "$MAX_NUM_SEQS" \
+      2>&1 | stdbuf -oL -eL ts '[%Y-%m-%d %H:%M:%S]' | tee -a "$log_file"
   ) &
-
-  local leader_pid=$!
-  echo "$leader_pid" > "$pid_file"
-  SERVER_PID="$leader_pid"
+  SERVER_PID=$!
+  echo "[INFO] SERVER_PID=$SERVER_PID"
 }
-
 
 stop_server() {
   local pid="$1"
-  [[ -n "$pid" ]] || return 0
+  [[ -n "${pid:-}" ]] || return 0
 
-  if kill -0 "$pid" >/dev/null 2>&1; then
-    echo "[INFO] Stopping server leader pid=$pid (kill process group -$pid)"
-    kill -TERM "-$pid" >/dev/null 2>&1 || true
+  echo "[INFO] Stopping server: leader pid=$pid"
 
-    local t0
-    t0="$(date +%s)"
-    while kill -0 "$pid" >/dev/null 2>&1; do
-      local t
-      t="$(date +%s)"
-      if (( t - t0 >= STOP_TIMEOUT_SEC )); then
-        echo "[WARN] Force killing process group -$pid"
-        kill -KILL "-$pid" >/dev/null 2>&1 || true
-        break
-      fi
-      sleep 0.2
-    done
+  # 1) Try graceful: kill process group of leader (best effort)
+  kill -TERM "-$pid" >/dev/null 2>&1 || true
+
+  local t0; t0="$(date +%s)"
+  while kill -0 "$pid" >/dev/null 2>&1; do
+    local t; t="$(date +%s)"
+    if (( t - t0 >= STOP_TIMEOUT_SEC )); then
+      echo "[WARN] Force kill group -$pid"
+      kill -KILL "-$pid" >/dev/null 2>&1 || true
+      break
+    fi
+    sleep 0.2
+  done
+
+  # 2) Port-based cleanup (MOST RELIABLE for uvicorn/vllm)
+  if ss -ltnp | grep -q ":${PORT}\b"; then
+    echo "[WARN] Port :$PORT still listening; killing by port"
+    fuser -k "${PORT}/tcp" >/dev/null 2>&1 || true
+    sleep 0.2
   fi
 
-  # Post-stop: ensure port released
+  # 3) GPU compute-app cleanup (just in case something escaped port kill)
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    # kill only processes named vllm/python that hold GPU (safer than killing all GPU users)
+    while read -r gpupid pname mem; do
+      if [[ "$pname" =~ vllm|python|uvicorn ]]; then
+        echo "[WARN] Killing GPU compute app pid=$gpupid pname=$pname mem=$mem"
+        kill -KILL "$gpupid" >/dev/null 2>&1 || true
+      fi
+    done < <(nvidia-smi --query-compute-apps=pid,process_name,used_gpu_memory --format=csv,noheader 2>/dev/null || true)
+  fi
+
   wait_port_released || true
 }
-
-write_meta() {
-  # Write a lightweight meta json (no jq dependency).
-  local start_ts="$1"
-  local end_ts="$2"
-
-  local git_rev="unknown"
-  if command -v git >/dev/null 2>&1 && git -C "$SCRIPT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    git_rev="$(git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
-  fi
-
-  local nvsmi="n/a"
-  if command -v nvidia-smi >/dev/null 2>&1; then
-    nvsmi="$(nvidia-smi --query-gpu=name,driver_version,cuda_version,persistence_mode,power.limit,clocks.current.graphics,clocks.current.memory --format=csv,noheader 2>/dev/null | head -n 1 || echo n/a)"
-  fi
-
-  cat >"$META_JSON" <<EOF
-{
-  "run_tag": "$(printf '%s' "$RUN_TAG")",
-  "start_utc": "$(printf '%s' "$start_ts")",
-  "end_utc": "$(printf '%s' "$end_ts")",
-  "host": "$(printf '%s' "$HOST")",
-  "port": "$(printf '%s' "$PORT")",
-  "model_served_name": "$(printf '%s' "$MODEL")",
-  "model_tag": "$(printf '%s' "$MODEL_TAG")",
-  "warmup": $N_WARMUP,
-  "trials": $N_TRIAL,
-  "max_tokens": $MAX_TOKENS,
-  "cpu_list": "$(printf '%s' "${CPU_LIST:-}")",
-  "mem_bind": "$(printf '%s' "${MEM_BIND:-}")",
-  "omp_num_threads": "$(printf '%s' "$OMP_NUM_THREADS")",
-  "tokenizers_parallelism": "$(printf '%s' "$TOKENIZERS_PARALLELISM")",
-  "script_dir": "$(printf '%s' "$SCRIPT_DIR")",
-  "git_rev_script_dir": "$(printf '%s' "$git_rev")",
-  "nvidia_smi_summary": "$(printf '%s' "$nvsmi" | sed 's/"/\\"/g')"
-}
-EOF
-
-  echo "[INFO] Wrote meta: $META_JSON"
-}
-
-# ====== Cleanup trap ======
 
 
 cleanup() {
-  if [[ "${SERVER_PID:-}" != "" ]]; then
+  if [[ -n "${SERVER_PID:-}" ]]; then
     stop_server "$SERVER_PID" || true
+    SERVER_PID=""
   fi
 }
-
 trap cleanup EXIT
 
-# ====== Sweep ======
-LOG_LIST=()
-REQ_LIST=()
-
+# -------- sweep runner --------
 P_LIST=(10 20 30 40 50 60 70 80 90 100)
 
-RUN_START="$(now_iso)"
+REQ_IMAGE_LIST=()
+REQ_AUDIO_LIST=()
+LOG_LIST=()
 
 for P in "${P_LIST[@]}"; do
   LOG_FILE="$LOG_DIR/${RUN_TAG}_pct${P}.log"
-  PID_FILE="$OUT_DIR/${RUN_TAG}_pct${P}.pid"
-  REQ_FILE="$OUT_DIR/${RUN_TAG}_pct${P}_requests.jsonl"
+  OUT_IMG="$OUT_DIR/${RUN_TAG}_pct${P}_image.jsonl"
+  OUT_AUD="$OUT_DIR/${RUN_TAG}_pct${P}_audio.jsonl"
 
   LOG_LIST+=("$LOG_FILE")
-  REQ_LIST+=("$REQ_FILE")
+  REQ_IMAGE_LIST+=("$OUT_IMG")
+  REQ_AUDIO_LIST+=("$OUT_AUD")
 
-  : > "$REQ_FILE"
+  : > "$OUT_IMG"
+  : > "$OUT_AUD"
 
+  cleanup_vllm
   preclean
+  start_server "$P" "$LOG_FILE"
 
-  start_server "$P" "$LOG_FILE" "$PID_FILE"
-  echo "[INFO] SERVER_PID=$SERVER_PID (pidfile=$PID_FILE)"
-
-  # Two-stage readiness
   wait_health
   ready_check
 
-  echo "[INFO] About to run request_sweep, writing to $REQ_FILE"
 
-  python3 "$SCRIPT_DIR/request_sweep_image.py" \
+# request_sweep.py & request_sweep_mm.py
+
+  # echo "[INFO] Running IMAGE sweep pct=$P -> $OUT_IMG"
+  # python3 "$SCRIPT_DIR/request_sweep_mm.py" \         # request_sweep.py & request_sweep_mm.py
+  #   --host "$HOST" --port "$PORT" \
+  #   --model "$MODEL" --percent "$P" \
+  #   --warmup "$N_WARMUP" --trials "$N_TRIAL" \
+  #   --max-tokens "$MAX_TOKENS" --temperature "$TEMP" \
+  #   --mode image \
+  #   --prompt "$PROMPT_IMAGE" \
+  #   --image-path "$IMAGE_PATH" \
+  #   --out-jsonl "$OUT_IMG" \
+  #   --modalities "$MODALITIES"
+
+
+
+
+  # echo "[INFO] Running AUDIO sweep pct=$P -> $OUT_AUD"
+  # python3 "$SCRIPT_DIR/request_sweep_mm.py" \
+  #   --host "$HOST" --port "$PORT" \
+  #   --model "$MODEL" --percent "$P" \
+  #   --warmup "$N_WARMUP" --trials "$N_TRIAL" \
+  #   --max-tokens "$MAX_TOKENS" --temperature "$TEMP" \
+  #   --mode audio \
+  #   --audio-send-mode "$AUDIO_SEND_MODE" \
+  #   --prompt "$PROMPT_AUDIO" \
+  #   --audio-path "$AUDIO_PATH" \
+  #   --out-jsonl "$OUT_AUD" \
+  #   --modalities "$MODALITIES"
+
+
+
+  # echo "[INFO] Running IMAGE sweep pct=$P -> $OUT_IMG"
+  # python3 "$SCRIPT_DIR/request_sweep.py" \
+  #   --host "$HOST" --port "$PORT" \
+  #   --model "$MODEL" --percent "$P" \
+  #   --warmup "$N_WARMUP" --trials "$N_TRIAL" \
+  #   --max-tokens "$MAX_TOKENS" --temperature "$TEMP" \
+  #   --modalities "$MODALITIES" \
+  #   --mode image \
+  #   --prompt "$PROMPT_IMAGE" \
+  #   --image-path "$IMAGE_PATH" \
+  #   --out-jsonl "$OUT_IMG"
+
+  # echo "[INFO] Running AUDIO sweep pct=$P -> $OUT_AUD"
+  # python3 "$SCRIPT_DIR/request_sweep.py" \
+  #   --host "$HOST" --port "$PORT" \
+  #   --model "$MODEL" --percent "$P" \
+  #   --warmup "$N_WARMUP" --trials "$N_TRIAL" \
+  #   --max-tokens "$MAX_TOKENS" --temperature "$TEMP" \
+  #   --modalities "$MODALITIES" \
+  #   --mode audio \
+  #   --audio-send-mode "$AUDIO_SEND_MODE" \
+  #   --prompt "$PROMPT_AUDIO" \
+  #   --audio-path "$AUDIO_PATH" \
+  #   --out-jsonl "$OUT_AUD"
+
+  # text-only 输出文件
+  OUT_TXT="$OUT_DIR/${RUN_TAG}_text_only.jsonl"
+  echo "[INFO] Running TEXT-ONLY sweep pct=$P -> $OUT_TXT"
+
+  python3 "$SCRIPT_DIR/request_sweep.py" \
     --host "$HOST" --port "$PORT" \
-    --model "$MODEL" \
-    --percent "$P" \
+    --model "$MODEL" --percent "$P" \
     --warmup "$N_WARMUP" --trials "$N_TRIAL" \
-    --max-tokens "$MAX_TOKENS" \
-    --temperature 0.0 \
-    --prompt "$PROMPT" \
-    --image-path "$IMAGE_PATH" \
-    --out-jsonl "$REQ_FILE"
+    --max-tokens "$MAX_TOKENS" --temperature "$TEMP" \
+    --modalities "$MODALITIES" \
+    --mode text \
+    --prompt "$PROMPT_TEXT" \
+    --out-jsonl "$OUT_TXT"
 
-
-  # Assert: request file must have content
-  if [[ ! -s "$REQ_FILE" ]]; then
-    echo "[ERROR] request_sweep produced empty file: $REQ_FILE" >&2
-    echo "[DEBUG] Last 200 lines of log: $LOG_FILE" >&2
-    tail -n 200 "$LOG_FILE" >&2 || true
-    exit 1
-  fi
-  echo "[INFO] request_sweep done, lines: $(wc -l < "$REQ_FILE")"
 
   stop_server "$SERVER_PID" || true
+  cleanup_vllm
   SERVER_PID=""
 
-  # Extra: ensure port really released before next round
-  wait_port_released || true
-
-  echo "[INFO] Done percent=$P"
+  echo "[INFO] Done pct=$P"
 done
 
-# ====== Combine per-percent requests ======
-: > "$REQ_JSONL"
-for f in "${REQ_LIST[@]}"; do
-  cat "$f" >> "$REQ_JSONL"
-done
-echo "[INFO] Combined requests into $REQ_JSONL (lines=$(wc -l < "$REQ_JSONL"))"
+# -------- merge all outputs --------
+MERGED_IMG="$OUT_DIR/${RUN_TAG}_image_all.jsonl"
+MERGED_AUD="$OUT_DIR/${RUN_TAG}_audio_all.jsonl"
+MERGED_ALL="$OUT_DIR/${RUN_TAG}_all.jsonl"
 
-if [[ ! -s "$REQ_JSONL" ]]; then
-  echo "[ERROR] Combined requests file is empty: $REQ_JSONL" >&2
-  exit 1
-fi
+: > "$MERGED_IMG"
+: > "$MERGED_AUD"
+: > "$MERGED_ALL"
 
-# ====== Merge logs + requests into CSV ======
-python3 "$SCRIPT_DIR/parse_gc_logs.py" \
-  --req-jsonl "$REQ_JSONL" \
-  --logs "${LOG_LIST[@]}" \
-  --out-csv "$CSV_OUT"
+for f in "${REQ_IMAGE_LIST[@]}"; do cat "$f" >> "$MERGED_IMG"; done
+for f in "${REQ_AUDIO_LIST[@]}"; do cat "$f" >> "$MERGED_AUD"; done
 
-RUN_END="$(now_iso)"
-write_meta "$RUN_START" "$RUN_END"
+cat "$MERGED_IMG" "$MERGED_AUD" > "$MERGED_ALL"
 
-echo "[OK] All done."
-echo "Requests: $REQ_JSONL"
-echo "Merged CSV: $CSV_OUT"
-echo "Meta: $META_JSON"
+echo "[OK] Sweep complete."
+echo "  image merged: $MERGED_IMG (lines=$(wc -l < "$MERGED_IMG"))"
+echo "  audio merged: $MERGED_AUD (lines=$(wc -l < "$MERGED_AUD"))"
+echo "  all merged  : $MERGED_ALL (lines=$(wc -l < "$MERGED_ALL"))"

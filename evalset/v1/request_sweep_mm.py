@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-request_sweep.py
 Reusable request sweep script for OpenAI-compatible /v1/chat/completions.
 
-Key behavior:
-- Can request text+audio output (modalities configurable, default: text,audio)
-- ALWAYS extracts and records TEXT-only output into pred_text, even if response contains audio.
+Features:
+- Supports text-only, image, and audio inputs
+- Local files -> data URL (default) or raw base64 (for input_audio)
+- Keeps only TEXT output (pred_text) even if model returns audio blocks
 - Writes JSONL records for warmup+trial with timings + usage + basic metadata
 """
 
@@ -16,7 +16,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import requests
 
@@ -73,6 +73,7 @@ def guess_audio_fmt_mime(p: Path) -> Tuple[str, str]:
         return "m4a", "audio/mp4"
     if suf in ("aac",):
         return "aac", "audio/aac"
+    # fallback (may still work)
     return suf or "wav", f"audio/{suf or 'wav'}"
 
 
@@ -114,75 +115,48 @@ def safe_get_usage(resp_json: Dict[str, Any]) -> Tuple[Optional[int], Optional[i
 
 
 def safe_get_text_only(resp_json: Dict[str, Any]) -> Optional[str]:
-    """
-    Extract ONLY text from response JSON, regardless of whether audio is also present.
-    Works for:
-    - message.content: str
-    - message.content: [{type:"text", text:"..."} ...]
-    - choices where one choice is audio-only and another is text-only
-    - choices where a single message includes both audio field and text blocks (we keep the text)
-    """
     choices = resp_json.get("choices")
     if not isinstance(choices, list) or not choices:
         return None
 
+    # 1) Prefer choices[0] first (matches vLLM-Omni examples: text first, audio second)
     ordered = choices[:1] + choices[1:]
-
-    def extract_text_from_content(content: Any) -> Optional[str]:
-        if isinstance(content, str):
-            s = content.strip()
-            return s or None
-        if isinstance(content, list):
-            parts: List[str] = []
-            for blk in content:
-                if isinstance(blk, dict) and blk.get("type") == "text" and isinstance(blk.get("text"), str):
-                    t = blk["text"].strip()
-                    if t:
-                        parts.append(t)
-            s = "\n".join(parts).strip()
-            return s or None
-        return None
 
     def extract_from_choice(ch: Dict[str, Any]) -> Optional[str]:
         msg = ch.get("message") if isinstance(ch, dict) else None
         if not isinstance(msg, dict):
             return None
 
-        # IMPORTANT: even if msg has audio, still try to extract text from content.
-        txt = extract_text_from_content(msg.get("content"))
-        if txt:
-            return txt
+        # If this choice carries audio, it's likely not the pure text branch
+        if "audio" in msg and msg["audio"] is not None:
+            return None
 
-        # Some servers might put text in other fields; keep conservative.
-        # If no content text exists, return None.
+        content = msg.get("content")
+        if isinstance(content, str):
+            s = content.strip()
+            return s or None
+
+        if isinstance(content, list):
+            parts = []
+            for blk in content:
+                if isinstance(blk, dict) and blk.get("type") == "text" and isinstance(blk.get("text"), str):
+                    t = blk["text"].strip()
+                    if t:
+                        parts.append(t)
+            return "\n".join(parts).strip() or None
+
         return None
 
+    # 2) Try ordered choices
     for ch in ordered:
         if isinstance(ch, dict):
             s = extract_from_choice(ch)
             if s:
                 return s
 
+    # 3) Fallback: nothing usable
     return None
 
-
-def response_has_audio(resp_json: Dict[str, Any]) -> bool:
-    choices = resp_json.get("choices")
-    if not isinstance(choices, list):
-        return False
-    for ch in choices:
-        if not isinstance(ch, dict):
-            continue
-        msg = ch.get("message")
-        if isinstance(msg, dict) and msg.get("audio") is not None:
-            return True
-        # some implementations embed audio blocks in content
-        content = msg.get("content") if isinstance(msg, dict) else None
-        if isinstance(content, list):
-            for blk in content:
-                if isinstance(blk, dict) and blk.get("type") in ("audio", "audio_url", "output_audio"):
-                    return True
-    return False
 
 
 # -----------------------
@@ -191,6 +165,7 @@ def response_has_audio(resp_json: Dict[str, Any]) -> bool:
 @dataclass
 class InputSpec:
     mode: str  # "text" | "image" | "audio"
+    # For image/audio: one of them is used depending on send_mode
     data_url: Optional[str] = None
     b64: Optional[str] = None
     fmt: Optional[str] = None
@@ -212,6 +187,7 @@ def build_input_spec(
             data_url, b64, fmt = file_to_data_url(image_path, "image")
             return InputSpec(mode="image", data_url=data_url, b64=b64, fmt=fmt, meta=image_path)
         if image_url:
+            # allow http(s) or data URL
             return InputSpec(mode="image", data_url=image_url, meta=image_url)
         raise ValueError("mode=image requires --image-path or --image-url")
 
@@ -229,7 +205,16 @@ def build_input_spec(
 # -----------------------
 # Request builder
 # -----------------------
-def build_messages(prompt: str, rid: str, inp: InputSpec, audio_send_mode: str) -> List[Dict[str, Any]]:
+def build_messages(
+    prompt: str,
+    rid: str,
+    inp: InputSpec,
+    audio_send_mode: str,
+) -> List[Dict[str, Any]]:
+    """
+    Build OpenAI-compatible messages array.
+    For multimodal, we use user.content blocks.
+    """
     blocks: List[Dict[str, Any]] = [{"type": "text", "text": f"[RID:{rid}] {prompt}"}]
 
     if inp.mode == "image":
@@ -246,20 +231,12 @@ def build_messages(prompt: str, rid: str, inp: InputSpec, audio_send_mode: str) 
                 raise ValueError("audio_url mode requires inp.data_url (data URL or http URL)")
             blocks.append({"type": "audio_url", "audio_url": {"url": inp.data_url}})
         else:
+            # input_audio: requires raw b64 + format
             if not inp.b64 or not inp.fmt:
                 raise ValueError("input_audio mode requires inp.b64 and inp.fmt (use --audio-path)")
             blocks.append({"type": "input_audio", "input_audio": {"data": inp.b64, "format": inp.fmt}})
 
     return [{"role": "user", "content": blocks}]
-
-
-def parse_modalities(s: str) -> Optional[List[str]]:
-    s = (s or "").strip()
-    if not s:
-        return None  # omit field
-    # allow "text,audio" or "text audio"
-    items = [x.strip() for x in s.replace(" ", ",").split(",") if x.strip()]
-    return items or None
 
 
 def post_chat_completion(
@@ -270,7 +247,7 @@ def post_chat_completion(
     max_tokens: int,
     temperature: float,
     timeout_s: int,
-    modalities: Optional[List[str]] = None,
+    modalities: Optional[List[str]] = None,   # 👈 NEW
 ) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "model": model,
@@ -280,12 +257,12 @@ def post_chat_completion(
         "stream": False,
     }
     if modalities is not None:
-        payload["modalities"] = modalities
-
+        payload["modalities"] = modalities      # 👈 NEW (per vLLM-Omni docs)
     headers = {"Content-Type": "application/json", "X-Request-Id": rid}
     resp = requests.post(url, json=payload, headers=headers, timeout=timeout_s)
     resp.raise_for_status()
     return resp.json()
+
 
 
 # -----------------------
@@ -301,9 +278,9 @@ def main() -> None:
 
     ap.add_argument("--warmup", type=int, default=5)
     ap.add_argument("--trials", type=int, default=20)
-    ap.add_argument("--max-tokens", type=int, default=128)
+    ap.add_argument("--max-tokens", type=int, default=512)
     ap.add_argument("--temperature", type=float, default=0.0)
-    ap.add_argument("--prompt", default="In 2-3 sentences, describe the input.")
+    ap.add_argument("--prompt", default="Describe the input in one concise sentence.")
     ap.add_argument("--timeout-s", type=int, default=600)
 
     ap.add_argument("--mode", choices=["text", "image", "audio"], required=True)
@@ -319,17 +296,13 @@ def main() -> None:
     g_aud.add_argument("--audio-url", help="http(s) URL or data URL")
     ap.add_argument("--audio-send-mode", choices=["audio_url", "input_audio"], default="audio_url")
 
-    # NEW: control output modalities
-    ap.add_argument(
-        "--modalities",
-        default="text,audio",
-        help='Comma/space separated. Examples: "text" or "text,audio". Empty string omits field.',
-    )
-
     ap.add_argument("--out-jsonl", required=True)
+
+    # Debug knob
     ap.add_argument("--save-raw", action="store_true", help="save raw response JSON to each record (big!)")
 
     args = ap.parse_args()
+
     url = f"http://{args.host}:{args.port}/v1/chat/completions"
 
     inp = build_input_spec(
@@ -339,8 +312,6 @@ def main() -> None:
         audio_path=args.audio_path,
         audio_url=args.audio_url,
     )
-
-    modalities = parse_modalities(args.modalities)
 
     total = args.warmup + args.trials
     for idx in range(total):
@@ -355,7 +326,6 @@ def main() -> None:
         pt = ct = tt = None
         pred_text: Optional[str] = None
         raw: Optional[Dict[str, Any]] = None
-        has_audio: Optional[bool] = None
 
         try:
             messages = build_messages(
@@ -364,6 +334,7 @@ def main() -> None:
                 inp=inp,
                 audio_send_mode=args.audio_send_mode,
             )
+            want_modalities = ["text"]  # ✅ 强制只输出 text，避免乱码来源
             resp_json = post_chat_completion(
                 url=url,
                 model=args.model,
@@ -372,12 +343,10 @@ def main() -> None:
                 max_tokens=args.max_tokens,
                 temperature=args.temperature,
                 timeout_s=args.timeout_s,
-                modalities=modalities,
+                modalities=want_modalities,
             )
             pt, ct, tt = safe_get_usage(resp_json)
             pred_text = safe_get_text_only(resp_json)
-            has_audio = response_has_audio(resp_json)
-
             if args.save_raw:
                 raw = resp_json
 
@@ -402,11 +371,8 @@ def main() -> None:
             "completion_tokens": ct,
             "total_tokens": tt,
 
-            # ✅ always keep TEXT only
+            # ✅ only keep text output
             "pred_text": pred_text,
-
-            # helpful debug signal
-            "resp_has_audio": has_audio,
 
             # meta
             "mode": args.mode,
@@ -414,7 +380,6 @@ def main() -> None:
             "prompt": args.prompt,
             "url": url,
             "audio_send_mode": (args.audio_send_mode if args.mode == "audio" else None),
-            "modalities": modalities,
         }
         if args.save_raw:
             rec["raw"] = raw
@@ -426,11 +391,12 @@ def main() -> None:
         if ok:
             print(
                 f"[{tag}] pct={args.percent:3d} rid={rid} latency={rec['latency_s']:.4f}s "
-                f"pt={pt} ct={ct} tt={tt} audio={int(bool(has_audio))} "
-                f"text_len={len(pred_text) if pred_text else 0}"
+                f"pt={pt} ct={ct} tt={tt} text_len={len(pred_text) if pred_text else 0}"
             )
         else:
-            print(f"[{tag}] pct={args.percent:3d} rid={rid} FAILED latency={rec['latency_s']:.4f}s err={err}")
+            print(
+                f"[{tag}] pct={args.percent:3d} rid={rid} FAILED latency={rec['latency_s']:.4f}s err={err}"
+            )
 
 
 if __name__ == "__main__":
