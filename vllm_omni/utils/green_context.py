@@ -1,61 +1,69 @@
-import time
-import os
-import ctypes
-import torch
 import contextvars
+import ctypes
+import os
 
+import torch
+from vllm.logger import init_logger
 
-# 当前请求ID（由模型forward处设置）
+logger = init_logger(__name__)
+
+# Request ID set by OmniGPUModelRunner._model_forward; used for per-request tracing.
 VLLM_REQ_ID = contextvars.ContextVar("VLLM_REQ_ID", default="-")
-# 当前stage id（优先从 env 推断）
-def _get_stage_id():
-    # 这些名字你可以按你实际环境再补充；抓不到就 '?'
-    for k in ("VLLM_OMNI_STAGE_ID", "OMNI_STAGE_ID", "VLLM_STAGE_ID", "STAGE_ID"):
-        v = os.getenv(k)
-        if v is not None:
-            return v
+
+
+def _get_stage_id() -> str:
+    """Resolve current stage id from environment for stage-local SM policies."""
+    for key in ("VLLM_OMNI_STAGE_ID", "OMNI_STAGE_ID", "VLLM_STAGE_ID", "STAGE_ID"):
+        value = os.getenv(key)
+        if value is not None:
+            return str(value)
     return "?"
 
-def __enter__(self):
-    if not self.enabled:
-        return self
-    self._prev = torch.cuda.current_stream()
-    torch.cuda.set_stream(self.stream)
 
-    # ✅ 第1行：enter日志（最小改动）
-    print(f"[GreenCtx][enter] pid={os.getpid()} stage={_get_stage_id()} req={VLLM_REQ_ID.get()} "
-          f"sm={self.actual_sm}/{self.total_sm} pct={self.percent} stream=0x{int(self.stream.cuda_stream):x}")
+def _resolve_percent(stage_id: str) -> int | None:
+    """Resolve SM percentage with stage-specific override first.
 
-    return self
+    Priority:
+    1) VLLM_GREEN_SM_PERCENT_STAGE_<stage_id> (e.g. ..._STAGE_0)
+    2) VLLM_GREEN_SM_PERCENT (global fallback)
+    """
+    stage_key = f"VLLM_GREEN_SM_PERCENT_STAGE_{stage_id}"
+    raw = os.getenv(stage_key)
+    if raw is None:
+        raw = os.getenv("VLLM_GREEN_SM_PERCENT")
+    if raw is None:
+        return None
+    return int(raw)
 
-def __exit__(self, exc_type, exc, tb):
-    if not self.enabled:
-        return False
-    torch.cuda.set_stream(self._prev)
-
-    # ✅ 第2行：exit日志（最小改动）
-    print(f"[GreenCtx][exit ] pid={os.getpid()} stage={_get_stage_id()} req={VLLM_REQ_ID.get()} "
-          f"exc={'None' if exc_type is None else exc_type.__name__}")
-
-    return False
 
 class GreenContext:
     def __init__(self):
-        self.enabled = os.getenv("VLLM_GREEN_SM_PERCENT") is not None
-        self.handle = None
-        self.stream = None
-        self.actual_sm = None
+        self.handle: int | None = None
+        self.stream: torch.cuda.ExternalStream | None = None
+        self.actual_sm: int | None = None
+        self.total_sm: int | None = None
+        self.align: int | None = None
+        self.max_valid: int | None = None
+        self.percent: int | None = None
+        self._prev = None
+        self.stage_id = _get_stage_id()
 
+        # Critical behavior:
+        # each stage process computes its own percent from env, so we can
+        # sweep stage-0/1/2 with different SM budgets without touching YAML.
+        resolved_percent = _resolve_percent(self.stage_id)
+        self.enabled = resolved_percent is not None
         if not self.enabled:
             return
 
-        percent = int(os.getenv("VLLM_GREEN_SM_PERCENT", "50"))
+        self.percent = resolved_percent
         device = int(os.getenv("VLLM_GREEN_DEVICE", "0"))
         lib = os.getenv("VLLM_GREEN_LIB", os.path.expanduser("~/Lucas/GreenContext/libgc_rt.so"))
 
         self._lib = ctypes.CDLL(lib)
         self._lib.gc_create_percent.argtypes = [
-            ctypes.c_int, ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
             ctypes.POINTER(ctypes.c_uint64),
             ctypes.POINTER(ctypes.c_uint64),
             ctypes.POINTER(ctypes.c_int),
@@ -77,7 +85,8 @@ class GreenContext:
         torch.cuda.set_device(device)
 
         rc = self._lib.gc_create_percent(
-            device, percent,
+            device,
+            self.percent,
             ctypes.byref(h),
             ctypes.byref(s),
             ctypes.byref(actual_sm),
@@ -91,13 +100,12 @@ class GreenContext:
         self.handle = h.value
         self.stream = torch.cuda.ExternalStream(s.value)
         self.actual_sm = actual_sm.value
-        self.percent = percent
         self.total_sm = total_sm.value
         self.align = align.value
         self.max_valid = max_valid.value
 
     def __enter__(self):
-        if not self.enabled:
+        if not self.enabled or self.stream is None:
             return self
         self._prev = torch.cuda.current_stream()
         torch.cuda.set_stream(self.stream)
@@ -106,7 +114,8 @@ class GreenContext:
     def __exit__(self, exc_type, exc, tb):
         if not self.enabled:
             return False
-        torch.cuda.set_stream(self._prev)
+        if self._prev is not None:
+            torch.cuda.set_stream(self._prev)
         return False
 
     def close(self):
@@ -115,4 +124,3 @@ class GreenContext:
             if rc != 0:
                 raise RuntimeError(f"gc_destroy failed rc={rc}")
             self.handle = None
-

@@ -50,10 +50,16 @@ logger = init_logger(__name__)
 
 def _stage_process_entry(target, stage_env: dict, *args, **kwargs):
     # 在 CUDA 初始化前设置环境变量（关键）
-    print("[Stage env] CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=",
-      os.environ.get("CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"))
+    print(
+        "[Stage env] CUDA_MPS_ACTIVE_THREAD_PERCENTAGE(before)=",
+        os.environ.get("CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"),
+    )
     if stage_env:
         os.environ.update({k: str(v) for k, v in stage_env.items()})
+    print(
+        "[Stage env] CUDA_MPS_ACTIVE_THREAD_PERCENTAGE(after)=",
+        os.environ.get("CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"),
+    )
     return target(*args, **kwargs)
 
 
@@ -435,6 +441,9 @@ def _stage_worker(
     import time as _time
 
     stage_id = stage_payload["stage_id"]
+    # Propagate stage id explicitly into worker env so lower-level runtime
+    # components (e.g. GreenContext) can bind stage-local policies reliably.
+    os.environ["VLLM_OMNI_STAGE_ID"] = str(stage_id)
     engine_args = stage_payload.get("engine_args", {})
     runtime_cfg = stage_payload.get("runtime", {})
     shm_threshold_bytes = int(stage_payload.get("shm_threshold_bytes", 65536))
@@ -875,6 +884,8 @@ async def _stage_worker_async(
     import time as _time
 
     stage_id = stage_payload["stage_id"]
+    # Async worker path needs the same stage-id propagation as sync worker.
+    _os.environ["VLLM_OMNI_STAGE_ID"] = str(stage_id)
     engine_args = stage_payload.get("engine_args", {})
     runtime_cfg = stage_payload.get("runtime", {})
     shm_threshold_bytes = int(stage_payload.get("shm_threshold_bytes", 65536))

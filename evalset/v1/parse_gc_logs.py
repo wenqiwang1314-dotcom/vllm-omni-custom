@@ -30,6 +30,8 @@ GC_EVT_RE = re.compile(
     re.IGNORECASE
 )
 
+RID_STAGE_PREFIX_RE = re.compile(r"^s\d+-(?P<rid>.+)$")
+
 
 def parse_ts(line: str) -> Tuple[Optional[datetime], str]:
     m = TS_RE.match(line)
@@ -72,6 +74,19 @@ def load_requests(req_jsonl: Path) -> Dict[str, dict]:
     return out
 
 
+def canonical_rid(rid: str) -> str:
+    """Normalize rid format for cross-file joins.
+
+    Runner-side logs may prefix request id as `s{stage}-<rid>` to make stage logs
+    grep-friendly, while client JSONL usually stores `<rid>` only.
+    We strip the stage prefix before joining.
+    """
+    m = RID_STAGE_PREFIX_RE.match(rid)
+    if m:
+        return m.group("rid")
+    return rid
+
+
 def parse_logs(log_paths: List[Path]) -> Tuple[Dict[int, GcInit], List[GcEvent]]:
     stage_init: Dict[int, GcInit] = {}
     events: List[GcEvent] = []
@@ -103,7 +118,7 @@ def parse_logs(log_paths: List[Path]) -> Tuple[Dict[int, GcInit], List[GcEvent]]
                 me = GC_EVT_RE.search(rest)
                 if me:
                     evt = me.group("evt").lower()
-                    rid = me.group("rid")
+                    rid = canonical_rid(me.group("rid"))
                     pct_s = me.group("pct")
                     sm_s = me.group("sm")
                     events.append(
@@ -220,4 +235,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
